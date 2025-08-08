@@ -1,0 +1,985 @@
+import os
+import sys
+import json
+import math
+import time
+import tempfile
+import subprocess
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+import numpy as np
+import librosa
+import soundfile as sf
+from scipy.signal import find_peaks
+import srt
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+# Опциональная тёмная тема
+try:
+    import qdarktheme
+
+    HAS_QDARK = True
+except Exception:
+    HAS_QDARK = False
+
+
+# ============ БЭКЕНД (анализ, сабы, кодирование) ============
+
+def ensure_dir(p: str):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+
+def win_to_ffmpeg_path(p: str) -> str:
+    return str(Path(p)).replace("\\", "/")
+
+
+def run_cmd_live(cmd: List[str], on_line=None) -> int:
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    if on_line:
+        for line in proc.stdout:
+            on_line(line.rstrip())
+    else:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+    proc.wait()
+    return proc.returncode
+
+
+def is_valid_ffmpeg_path(path: str) -> bool:
+    """Проверяет, является ли путь действительным исполняемым файлом FFmpeg"""
+    if not path:
+        return False
+
+    # Проверка абсолютного пути
+    if os.path.isfile(path):
+        return True
+
+    # Проверка наличия в системном PATH
+    for system_path in os.environ["PATH"].split(os.pathsep):
+        full_path = os.path.join(system_path, path)
+        if os.path.isfile(full_path):
+            return True
+
+    # Проверка с расширениями (для Windows)
+    if sys.platform == "win32":
+        for ext in [".exe", ".bat", ".cmd"]:
+            if os.path.isfile(path + ext):
+                return True
+            for system_path in os.environ["PATH"].split(os.pathsep):
+                full_path = os.path.join(system_path, path + ext)
+                if os.path.isfile(full_path):
+                    return True
+
+    return False
+
+
+def ffprobe_duration(video_path: str, ffprobe_path: str) -> float:
+    # Проверяем доступность ffprobe
+    if not is_valid_ffmpeg_path(ffprobe_path):
+        raise RuntimeError(f"ffprobe не найден по пути: {ffprobe_path}")
+
+    cmd = [
+        ffprobe_path, "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            return 0.0
+        return float(res.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def extract_audio_to_wav(video_path: str, wav_path: str, ffmpeg_path: str, sr: int = 16000) -> None:
+    # Проверяем доступность ffmpeg
+    if not is_valid_ffmpeg_path(ffmpeg_path):
+        raise RuntimeError(f"ffmpeg не найден по пути: {ffmpeg_path}")
+
+    cmd = [
+        ffmpeg_path, "-y",
+        "-i", video_path,
+        "-vn", "-ac", "1",
+        "-ar", str(sr),
+        "-f", "wav",
+        wav_path
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def compute_energy_peaks(wav_path: str, sr: int = 16000) -> Tuple[np.ndarray, np.ndarray]:
+    y, sr = librosa.load(wav_path, sr=sr, mono=True)
+    if np.max(np.abs(y)) > 0:
+        y = y / np.max(np.abs(y))
+    frame_length = 2048
+    hop_length = 512
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512, center=True)[0]
+    times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop_length)
+    if np.max(rms) > 0:
+        rms = rms / np.max(rms)
+    rms_smooth = librosa.effects.harmonic(rms, margin=2.0)
+    return times, rms_smooth
+
+
+def pick_top_peaks(times: np.ndarray, energy: np.ndarray, n: int, min_distance_s: float) -> List[float]:
+    if len(times) < 3 or n <= 0:
+        return []
+    dt = float(np.median(np.diff(times)))
+    if not np.isfinite(dt) or dt <= 0:
+        dt = 0.01
+    min_distance_samples = max(1, int(min_distance_s / dt))
+    peaks, props = find_peaks(energy, distance=min_distance_samples, prominence=np.std(energy) * 0.5)
+    if len(peaks) == 0:
+        return []
+    scores = props["prominences"] if "prominences" in props else energy[peaks]
+    order = np.argsort(scores)[::-1]
+    top_peaks = peaks[order][:n]
+    return sorted(times[top_peaks].tolist())
+
+
+def propose_fallback_marks(duration: float, n: int, guard: float = 2.0) -> List[float]:
+    if n <= 0:
+        return []
+    usable = max(0.0, duration - 2 * guard)
+    if usable <= 0:
+        return [min(duration / 2, max(0.0, duration - guard))]
+    step = usable / (n + 1)
+    return [guard + step * (i + 1) for i in range(n)]
+
+
+def clamp_segment(center: float, pre: float, post: float, duration: float) -> Tuple[float, float]:
+    start = max(0.0, center - pre)
+    end = min(duration, center + post)
+    target_len = pre + post
+    cur_len = end - start
+    if cur_len < target_len and duration >= target_len:
+        deficit = target_len - cur_len
+        shift_left = min(start, deficit / 2)
+        shift_right = min(duration - end, deficit - shift_left)
+        start -= shift_left
+        end += shift_right
+    return start, end
+
+
+def transcribe_segment_with_whisper(
+        video_path: str,
+        start: float,
+        duration: float,
+        language: str,
+        model_size: str,
+        device: str,
+        compute_type: str,
+        ffmpeg_path: str
+) -> List[srt.Subtitle]:
+    from faster_whisper import WhisperModel
+
+    with tempfile.TemporaryDirectory() as td:
+        seg_wav = os.path.join(td, "seg.wav")
+        cmd = [
+            ffmpeg_path, "-y",
+            "-ss", f"{start:.3f}",
+            "-t", f"{duration:.3f}",
+            "-i", video_path,
+            "-vn", "-ac", "1",
+            "-ar", "16000",
+            "-f", "wav",
+            seg_wav
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        segments, info = model.transcribe(seg_wav, language=language, vad_filter=True,
+                                          vad_parameters=dict(min_silence_duration_ms=200))
+        subs = []
+        idx = 1
+        for seg in segments:
+            start_s = max(0.0, seg.start)
+            end_s = max(start_s, seg.end)
+            content = seg.text.strip()
+            subs.append(srt.Subtitle(
+                index=idx,
+                start=srt.srt_timestamp_to_timedelta(srt.timedelta_to_srt_timestamp(start_s)),
+                end=srt.srt_timestamp_to_timedelta(srt.timedelta_to_srt_timestamp(end_s)),
+                content=content
+            ))
+            idx += 1
+        return subs
+
+
+def write_srt(subs: List[srt.Subtitle], path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(srt.compose(subs))
+
+
+def build_filter_complex(
+        subs_path: str,
+        font_dir: str,
+        font_name_hint: str,
+        out_w: int,
+        out_h: int,
+        rotate_content_90: bool,
+        sub_font_size: int,
+        sub_outline: int,
+        sub_alignment: int,
+        sub_margin_v: int
+) -> str:
+    subs_path = win_to_ffmpeg_path(subs_path)
+    font_dir = win_to_ffmpeg_path(font_dir)
+
+    fg_scale = f"scale={out_w}:-2:flags=lanczos"
+    fg_chain = (f"transpose=1,{fg_scale}") if rotate_content_90 else fg_scale
+
+    bg_chain = f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,boxblur=20:1,crop={out_w}:{out_h}"
+    overlay = "overlay=(W-w)/2:(H-h)/2"
+
+    force_style = (
+        f"FontName={font_name_hint},"
+        f"FontSize={sub_font_size},"
+        f"OutlineColour=&H000000&,BorderStyle=3,Outline={sub_outline},Shadow=0,"
+        f"Alignment={sub_alignment},MarginV={sub_margin_v}"
+    )
+
+    filter_complex = (
+        f"[0:v]split=2[bg][fg];"
+        f"[bg]{bg_chain}[bg2];"
+        f"[fg]{fg_chain}[fg2];"
+        f"[bg2][fg2]{overlay},"
+        f"subtitles='{subs_path}':fontsdir='{font_dir}':force_style='{force_style}'"
+    )
+    return filter_complex
+
+
+def encode_segment(
+        video_path: str,
+        start: float,
+        duration: float,
+        srt_path: str,
+        font_file: str,
+        ffmpeg_path: str,
+        out_path: str,
+        rotate_content_90: bool,
+        out_w: int,
+        out_h: int,
+        out_fps: int,
+        nvenc_preset: str,
+        nvenc_cq: int,
+        nvenc_bitrate: str,
+        nvenc_maxrate: str,
+        nvenc_bufsize: str,
+        on_line=None
+):
+    # Проверяем доступность ffmpeg
+    if not is_valid_ffmpeg_path(ffmpeg_path):
+        raise RuntimeError(f"ffmpeg не найден по пути: {ffmpeg_path}")
+
+    ensure_dir(os.path.dirname(out_path))
+    font_dir = os.path.dirname(font_file)
+
+    filter_complex = build_filter_complex(
+        subs_path=srt_path,
+        font_dir=font_dir,
+        font_name_hint=Path(font_file).stem,  # подсказка имени
+        out_w=out_w,
+        out_h=out_h,
+        rotate_content_90=rotate_content_90,
+        sub_font_size=54,
+        sub_outline=6,
+        sub_alignment=2,
+        sub_margin_v=80
+    )
+
+    cmd = [
+        ffmpeg_path, "-y",
+        "-ss", f"{start:.3f}",
+        "-t", f"{duration:.3f}",
+        "-i", video_path,
+        "-filter_complex", filter_complex,
+        "-map", "0:a:0?",
+        "-c:v", "h264_nvenc",
+        "-rc", "vbr",
+        "-cq", str(nvenc_cq),
+        "-b:v", nvenc_bitrate,
+        "-maxrate", nvenc_maxrate,
+        "-bufsize", nvenc_bufsize,
+        "-preset", nvenc_preset,
+        "-pix_fmt", "yuv420p",
+        "-r", str(out_fps),
+        "-c:a", "aac",
+        "-b:a", "160k",
+        "-movflags", "+faststart",
+        "-threads", "0",
+        out_path
+    ]
+    code = run_cmd_live(cmd, on_line=on_line)
+    if code != 0:
+        raise RuntimeError(f"ffmpeg failed with code {code}")
+
+
+@dataclass
+class CutterConfig:
+    input_dir: str = r"D:\tiktok\main_shorts"
+    output_dir: str = r"D:\tiktok\output"
+    font_path: str = r"C:\Users\giddary\PycharmProjects\PythonProject1\ofont.ru_Creepster.ttf"
+    ffmpeg_path: str = "ffmpeg"  # Путь по умолчанию (ищет в PATH)
+    ffprobe_path: str = "ffprobe"  # Путь по умолчанию
+
+    num_shorts: int = 5
+    seg_total_len: float = 20.0
+    seg_pre: float = 6.0
+    seg_post: float = 14.0
+    min_gap_factor: float = 0.6  # дистанция между пиками = seg_total_len * factor
+
+    language: str = "ru"
+    whisper_model: str = "small"
+    whisper_device: str = "cuda"  # "cuda" или "cpu"
+    whisper_compute: str = "float16"  # "float16" для GPU
+
+    out_w: int = 1080
+    out_h: int = 1920
+    fps: int = 30
+    rotate90: bool = False
+
+    nvenc_preset: str = "p4"  # p1..p7
+    nvenc_cq: int = 19
+    nvenc_bitrate: str = "8M"
+    nvenc_maxrate: str = "12M"
+    nvenc_bufsize: str = "16M"
+
+    enable_subs: bool = True
+
+    def save(self, path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(asdict(self), f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def load(path: str) -> "CutterConfig":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cfg = CutterConfig()
+        for k, v in data.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+        return cfg
+
+
+class CutterWorker(QtCore.QThread):
+    progress_changed = QtCore.Signal(int)  # 0..100
+    status_line = QtCore.Signal(str)
+    finished_ok = QtCore.Signal()
+    finished_err = QtCore.Signal(str)
+
+    def __init__(self, cfg: CutterConfig, videos: List[str], parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.videos = videos
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def log(self, msg: str):
+        self.status_line.emit(msg)
+
+    def run(self):
+        try:
+            self._run_impl()
+            if not self._cancel:
+                self.finished_ok.emit()
+        except Exception as e:
+            self.finished_err.emit(str(e))
+
+    def _run_impl(self):
+        cfg = self.cfg
+
+        # Проверка доступности CUDA
+        if cfg.whisper_device == "cuda":
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    self.log("CUDA недоступна! Переключаюсь на CPU")
+                    cfg.whisper_device = "cpu"
+            except ImportError:
+                self.log("PyTorch не установлен, проверка CUDA невозможна")
+            except Exception as e:
+                self.log(f"Ошибка проверки CUDA: {str(e)}. Переключаюсь на CPU")
+                cfg.whisper_device = "cpu"
+
+        ensure_dir(cfg.output_dir)
+        total_jobs = len(self.videos) * max(1, cfg.num_shorts)
+        done_jobs = 0
+
+        for vpath in self.videos:
+            if self._cancel:
+                return
+            base = Path(vpath).stem
+            self.log(f"=== Видео: {vpath}")
+
+            try:
+                duration = ffprobe_duration(vpath, cfg.ffprobe_path)
+            except Exception as e:
+                self.log(f"Ошибка получения длительности: {str(e)}")
+                continue
+
+            if duration <= 0:
+                self.log("Не удалось получить длительность — пропуск.")
+                continue
+            self.log(f"Длительность: {duration:.2f} c")
+
+            with tempfile.TemporaryDirectory() as td:
+                try:
+                    wav_path = os.path.join(td, "audio.wav")
+                    extract_audio_to_wav(vpath, wav_path, cfg.ffmpeg_path, sr=16000)
+                    times, energy = compute_energy_peaks(wav_path, sr=16000)
+                except Exception as e:
+                    self.log(f"Ошибка обработки аудио: {str(e)}")
+                    continue
+
+                min_gap = max(4.0, cfg.seg_total_len * cfg.min_gap_factor)
+                centers = pick_top_peaks(times, energy, n=cfg.num_shorts, min_distance_s=min_gap)
+                if len(centers) < cfg.num_shorts:
+                    fallback = propose_fallback_marks(duration, cfg.num_shorts - len(centers),
+                                                      guard=cfg.seg_total_len / 2)
+                    centers = sorted(centers + fallback)[:cfg.num_shorts]
+
+            pre, post = cfg.seg_pre, cfg.seg_post
+            if abs((pre + post) - cfg.seg_total_len) > 1e-3:
+                pre = cfg.seg_total_len * 0.35
+                post = cfg.seg_total_len - pre
+
+            segments = [clamp_segment(c, pre, post, duration) for c in centers][:cfg.num_shorts]
+
+            for i, (ss, ee) in enumerate(segments, 1):
+                if self._cancel:
+                    return
+                seg_dur = max(0.5, ee - ss)
+                self.log(f"→ Сегмент {i}: {ss:.2f}–{ee:.2f} ({seg_dur:.2f} c)")
+
+                with tempfile.TemporaryDirectory() as srt_td:
+                    srt_path = os.path.join(srt_td, "subs.srt")
+                    if cfg.enable_subs:
+                        try:
+                            subs = transcribe_segment_with_whisper(
+                                video_path=vpath,
+                                start=ss,
+                                duration=seg_dur,
+                                language=cfg.language,
+                                model_size=cfg.whisper_model,
+                                device=cfg.whisper_device,
+                                compute_type=cfg.whisper_compute,
+                                ffmpeg_path=cfg.ffmpeg_path
+                            )
+                            write_srt(subs, srt_path)
+                        except Exception as e:
+                            self.log(f"[WARN] Ошибка транскрипции: {e}. Продолжаем без субтитров.")
+                            # пустой файл — ffmpeg все равно ожидает путь
+                            with open(srt_path, "w", encoding="utf-8") as f:
+                                f.write("")
+                    else:
+                        with open(srt_path, "w", encoding="utf-8") as f:
+                            f.write("")
+
+                    out_name = f"{base}_short_{i:02d}.mp4"
+                    out_path = os.path.join(cfg.output_dir, out_name)
+
+                    def on_ff_line(line: str):
+                        # Можно распарсить прогресс, но оставим стрим логов
+                        self.status_line.emit(line)
+
+                    try:
+                        encode_segment(
+                            video_path=vpath,
+                            start=ss,
+                            duration=seg_dur,
+                            srt_path=srt_path,
+                            font_file=cfg.font_path,
+                            ffmpeg_path=cfg.ffmpeg_path,
+                            out_path=out_path,
+                            rotate_content_90=cfg.rotate90,
+                            out_w=cfg.out_w,
+                            out_h=cfg.out_h,
+                            out_fps=cfg.fps,
+                            nvenc_preset=cfg.nvenc_preset,
+                            nvenc_cq=cfg.nvenc_cq,
+                            nvenc_bitrate=cfg.nvenc_bitrate,
+                            nvenc_maxrate=cfg.nvenc_maxrate,
+                            nvenc_bufsize=cfg.nvenc_bufsize,
+                            on_line=on_ff_line
+                        )
+                    except Exception as e:
+                        self.log(f"Ошибка кодирования сегмента: {str(e)}")
+                        continue
+
+                done_jobs += 1
+                pct = int((done_jobs / max(1, total_jobs)) * 100)
+                self.progress_changed.emit(pct)
+
+        self.log("Готово.")
+
+
+# ============ GUI ============
+
+class LabeledSpin(QtWidgets.QWidget):
+    def __init__(self, label: str, minimum: int, maximum: int, value: int, step: int = 1, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.lab = QtWidgets.QLabel(label)
+        self.spin = QtWidgets.QSpinBox()
+        self.spin.setRange(minimum, maximum)
+        self.spin.setSingleStep(step)
+        self.spin.setValue(value)
+        lay.addWidget(self.lab)
+        lay.addWidget(self.spin)
+
+
+class LabeledDSpin(QtWidgets.QWidget):
+    def __init__(self, label: str, minimum: float, maximum: float, value: float, step: float = 0.5, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.lab = QtWidgets.QLabel(label)
+        self.spin = QtWidgets.QDoubleSpinBox()
+        self.spin.setRange(minimum, maximum)
+        self.spin.setDecimals(2)
+        self.spin.setSingleStep(step)
+        self.spin.setValue(value)
+        lay.addWidget(self.lab)
+        lay.addWidget(self.spin)
+
+
+class PathPicker(QtWidgets.QWidget):
+    changed = QtCore.Signal(str)
+
+    def __init__(self, label: str, mode: str = "dir", start: str = "", parent=None):
+        super().__init__(parent)
+        self.mode = mode  # "dir" | "file"
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.lab = QtWidgets.QLabel(label)
+        self.edit = QtWidgets.QLineEdit(start)
+        self.btn = QtWidgets.QPushButton("Выбрать...")
+        lay.addWidget(self.lab)
+        lay.addWidget(self.edit, 1)
+        lay.addWidget(self.btn)
+        self.btn.clicked.connect(self.pick)
+        self.edit.textChanged.connect(self.changed.emit)
+
+    def pick(self):
+        if self.mode == "dir":
+            d = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите папку", self.edit.text() or os.getcwd())
+            if d:
+                self.edit.setText(d)
+        else:
+            f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Выберите файл", self.edit.text() or os.getcwd(),
+                                                         "Все файлы (*.*)")
+            if f:
+                self.edit.setText(f)
+
+    def text(self) -> str:
+        return self.edit.text().strip()
+
+    def set_text(self, t: str):
+        self.edit.setText(t)
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Shorts/TikTok Cutter — Config & Runner")
+        self.setMinimumSize(1100, 700)
+        self.worker: Optional[CutterWorker] = None
+
+        self.cfg = CutterConfig()
+
+        cw = QtWidgets.QWidget()
+        self.setCentralWidget(cw)
+        main = QtWidgets.QHBoxLayout(cw)
+        main.setContentsMargins(10, 10, 10, 10)
+        main.setSpacing(10)
+
+        # Left panel: settings
+        left = QtWidgets.QVBoxLayout()
+        left.setSpacing(10)
+        main.addLayout(left, 0)
+
+        # Group: Paths
+        grp_paths = QtWidgets.QGroupBox("Пути")
+        v = QtWidgets.QVBoxLayout(grp_paths)
+        self.p_input = PathPicker("Входная папка:", "dir", self.cfg.input_dir)
+        self.p_output = PathPicker("Выходная папка:", "dir", self.cfg.output_dir)
+        self.p_font = PathPicker("Шрифт (ttf):", "file", self.cfg.font_path)
+        self.p_ffmpeg = PathPicker("Путь к ffmpeg:", "file", self.cfg.ffmpeg_path)
+        self.p_ffprobe = PathPicker("Путь к ffprobe:", "file", self.cfg.ffprobe_path)
+        v.addWidget(self.p_input)
+        v.addWidget(self.p_output)
+        v.addWidget(self.p_font)
+        v.addWidget(self.p_ffmpeg)
+        v.addWidget(self.p_ffprobe)
+        left.addWidget(grp_paths)
+
+        # Group: Detection & segments
+        grp_det = QtWidgets.QGroupBox("Сегменты и интересные моменты")
+        v = QtWidgets.QGridLayout(grp_det)
+        self.sp_num = LabeledSpin("Кол-во шортов на видео:", 1, 50, self.cfg.num_shorts)
+        self.ds_total = LabeledDSpin("Длина шорта (с):", 5.0, 120.0, self.cfg.seg_total_len, 1.0)
+        self.ds_pre = LabeledDSpin("До пика (с):", 0.0, 60.0, self.cfg.seg_pre, 0.5)
+        self.ds_post = LabeledDSpin("После пика (с):", 0.0, 120.0, self.cfg.seg_post, 0.5)
+        self.ds_gap = LabeledDSpin("Мин. разнос (x длины):", 0.2, 1.5, self.cfg.min_gap_factor, 0.05)
+        v.addWidget(self.sp_num, 0, 0, 1, 2)
+        v.addWidget(self.ds_total, 1, 0)
+        v.addWidget(self.ds_pre, 1, 1)
+        v.addWidget(self.ds_post, 2, 0)
+        v.addWidget(self.ds_gap, 2, 1)
+        left.addWidget(grp_det)
+
+        # Group: Subtitles & Whisper
+        grp_subs = QtWidgets.QGroupBox("Субтитры (Whisper)")
+        v = QtWidgets.QGridLayout(grp_subs)
+        self.cb_enable_subs = QtWidgets.QCheckBox("Включить субтитры")
+        self.cb_enable_subs.setChecked(self.cfg.enable_subs)
+        self.cmb_lang = QtWidgets.QComboBox()
+        self.cmb_lang.addItems(["ru", "en"])
+        self.cmb_lang.setCurrentText(self.cfg.language)
+        self.cmb_model = QtWidgets.QComboBox()
+        self.cmb_model.addItems(["tiny", "base", "small", "medium", "large-v3"])
+        self.cmb_model.setCurrentText(self.cfg.whisper_model)
+        self.cmb_device = QtWidgets.QComboBox()
+        self.cmb_device.addItems(["cuda", "cpu"])
+        self.cmb_device.setCurrentText(self.cfg.whisper_device)
+        self.cmb_compute = QtWidgets.QComboBox()
+        self.cmb_compute.addItems(["float16", "float32", "int8_float16"])
+        self.cmb_compute.setCurrentText(self.cfg.whisper_compute)
+
+        v.addWidget(self.cb_enable_subs, 0, 0, 1, 2)
+        v.addWidget(QtWidgets.QLabel("Язык:"), 1, 0)
+        v.addWidget(self.cmb_lang, 1, 1)
+        v.addWidget(QtWidgets.QLabel("Модель:"), 2, 0)
+        v.addWidget(self.cmb_model, 2, 1)
+        v.addWidget(QtWidgets.QLabel("Устройство:"), 3, 0)
+        v.addWidget(self.cmb_device, 3, 1)
+        v.addWidget(QtWidgets.QLabel("Тип вычислений:"), 4, 0)
+        v.addWidget(self.cmb_compute, 4, 1)
+        left.addWidget(grp_subs)
+
+        # Group: Output video
+        grp_vid = QtWidgets.QGroupBox("Вывод (видео)")
+        v = QtWidgets.QGridLayout(grp_vid)
+        self.sp_w = LabeledSpin("Ширина:", 360, 2160, self.cfg.out_w, 10)
+        self.sp_h = LabeledSpin("Высота:", 640, 3840, self.cfg.out_h, 10)
+        self.sp_fps = LabeledSpin("FPS:", 24, 120, self.cfg.fps, 1)
+        self.cb_rot = QtWidgets.QCheckBox("Повернуть контент на 90°")
+        self.cb_rot.setChecked(self.cfg.rotate90)
+        v.addWidget(self.sp_w, 0, 0)
+        v.addWidget(self.sp_h, 0, 1)
+        v.addWidget(self.sp_fps, 1, 0)
+        v.addWidget(self.cb_rot, 1, 1)
+        left.addWidget(grp_vid)
+
+        # Group: NVENC
+        grp_nv = QtWidgets.QGroupBox("NVENC (качество/скорость)")
+        v = QtWidgets.QGridLayout(grp_nv)
+        self.cmb_preset = QtWidgets.QComboBox()
+        self.cmb_preset.addItems(["p1", "p2", "p3", "p4", "p5", "p6", "p7"])
+        self.cmb_preset.setCurrentText(self.cfg.nvenc_preset)
+        self.sp_cq = LabeledSpin("CQ (меньше=лучше):", 1, 40, self.cfg.nvenc_cq, 1)
+        self.ed_br = QtWidgets.QLineEdit(self.cfg.nvenc_bitrate)
+        self.ed_mr = QtWidgets.QLineEdit(self.cfg.nvenc_maxrate)
+        self.ed_bs = QtWidgets.QLineEdit(self.cfg.nvenc_bufsize)
+
+        v.addWidget(QtWidgets.QLabel("Preset:"), 0, 0)
+        v.addWidget(self.cmb_preset, 0, 1)
+        v.addWidget(self.sp_cq, 1, 0, 1, 2)
+        v.addWidget(QtWidgets.QLabel("Bitrate:"), 2, 0)
+        v.addWidget(self.ed_br, 2, 1)
+        v.addWidget(QtWidgets.QLabel("Maxrate:"), 3, 0)
+        v.addWidget(self.ed_mr, 3, 1)
+        v.addWidget(QtWidgets.QLabel("Bufsize:"), 4, 0)
+        v.addWidget(self.ed_bs, 4, 1)
+        left.addWidget(grp_nv)
+
+        # Profiles & actions
+        prof_lay = QtWidgets.QHBoxLayout()
+        self.btn_save_prof = QtWidgets.QPushButton("Сохранить профиль…")
+        self.btn_load_prof = QtWidgets.QPushButton("Загрузить профиль…")
+        prof_lay.addWidget(self.btn_save_prof)
+        prof_lay.addWidget(self.btn_load_prof)
+        left.addLayout(prof_lay)
+
+        left.addStretch(1)
+
+        # Right panel: videos list + control + log
+        right = QtWidgets.QVBoxLayout()
+        main.addLayout(right, 1)
+
+        # Videos list
+        grp_list = QtWidgets.QGroupBox("Видео во входной папке")
+        v = QtWidgets.QVBoxLayout(grp_list)
+        self.tbl = QtWidgets.QTableWidget(0, 3)
+        self.tbl.setHorizontalHeaderLabels(["Включить", "Файл", "Длительность (с)"])
+        self.tbl.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        self.tbl.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        v.addWidget(self.tbl)
+        refresh_lay = QtWidgets.QHBoxLayout()
+        self.btn_refresh = QtWidgets.QPushButton("Обновить список")
+        refresh_lay.addWidget(self.btn_refresh)
+        v.addLayout(refresh_lay)
+        right.addWidget(grp_list, 2)
+
+        # Control buttons
+        ctrl_lay = QtWidgets.QHBoxLayout()
+        self.btn_start = QtWidgets.QPushButton("Старт")
+        self.btn_cancel = QtWidgets.QPushButton("Отмена")
+        self.btn_open_out = QtWidgets.QPushButton("Открыть выходную папку")
+        self.btn_cancel.setEnabled(False)
+        ctrl_lay.addWidget(self.btn_start)
+        ctrl_lay.addWidget(self.btn_cancel)
+        ctrl_lay.addWidget(self.btn_open_out)
+        right.addLayout(ctrl_lay)
+
+        # Progress + log
+        self.pb = QtWidgets.QProgressBar()
+        self.pb.setRange(0, 100)
+        self.pb.setValue(0)
+        right.addWidget(self.pb)
+
+        self.log = QtWidgets.QPlainTextEdit()
+        self.log.setReadOnly(True)
+        right.addWidget(self.log, 3)
+
+        # Signals
+        self.btn_refresh.clicked.connect(self.refresh_videos)
+        self.btn_start.clicked.connect(self.start_processing)
+        self.btn_cancel.clicked.connect(self.cancel_processing)
+        self.btn_open_out.clicked.connect(self.open_output_dir)
+        self.btn_save_prof.clicked.connect(self.save_profile)
+        self.btn_load_prof.clicked.connect(self.load_profile)
+        self.p_input.changed.connect(lambda _: self.refresh_videos())
+
+        # Init
+        self.refresh_videos()
+
+    def append_log(self, text: str):
+        self.log.appendPlainText(text)
+
+    def open_output_dir(self):
+        path = self.cfg.output_dir or self.p_output.text()
+        if not path:
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
+
+    def table_videos(self) -> List[str]:
+        res = []
+        for r in range(self.tbl.rowCount()):
+            chk = self.tbl.cellWidget(r, 0)
+            if isinstance(chk, QtWidgets.QCheckBox) and chk.isChecked():
+                item = self.tbl.item(r, 1)
+                if item:
+                    res.append(item.data(QtCore.Qt.ItemDataRole.UserRole))
+        return res
+
+    def refresh_videos(self):
+        in_dir = self.p_input.text().strip() or self.cfg.input_dir
+        exts = (".mp4", ".mov", ".mkv", ".avi", ".m4v")
+        files = []
+        if os.path.isdir(in_dir):
+            for name in os.listdir(in_dir):
+                if name.lower().endswith(exts):
+                    files.append(os.path.join(in_dir, name))
+        self.tbl.setRowCount(0)
+
+        # Получаем текущие пути из GUI
+        ffprobe_path = self.p_ffprobe.text().strip()
+
+        for f in files:
+            row = self.tbl.rowCount()
+            self.tbl.insertRow(row)
+            chk = QtWidgets.QCheckBox()
+            chk.setChecked(True)
+            self.tbl.setCellWidget(row, 0, chk)
+
+            it_name = QtWidgets.QTableWidgetItem(os.path.basename(f))
+            it_name.setData(QtCore.Qt.ItemDataRole.UserRole, f)
+            self.tbl.setItem(row, 1, it_name)
+
+            try:
+                dur = ffprobe_duration(f, ffprobe_path)
+                dur_text = f"{dur:.2f}"
+            except Exception as e:
+                dur = 0.0
+                dur_text = f"Ошибка: {str(e)}"
+
+            it_dur = QtWidgets.QTableWidgetItem(dur_text)
+            it_dur.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            self.tbl.setItem(row, 2, it_dur)
+
+    def pull_config(self) -> CutterConfig:
+        cfg = CutterConfig()
+        cfg.input_dir = self.p_input.text().strip()
+        cfg.output_dir = self.p_output.text().strip()
+        cfg.font_path = self.p_font.text().strip()
+        cfg.ffmpeg_path = self.p_ffmpeg.text().strip()
+        cfg.ffprobe_path = self.p_ffprobe.text().strip()
+
+        cfg.num_shorts = int(self.sp_num.spin.value())
+        cfg.seg_total_len = float(self.ds_total.spin.value())
+        cfg.seg_pre = float(self.ds_pre.spin.value())
+        cfg.seg_post = float(self.ds_post.spin.value())
+        cfg.min_gap_factor = float(self.ds_gap.spin.value())
+
+        cfg.enable_subs = self.cb_enable_subs.isChecked()
+        cfg.language = self.cmb_lang.currentText()
+        cfg.whisper_model = self.cmb_model.currentText()
+        cfg.whisper_device = self.cmb_device.currentText()
+        cfg.whisper_compute = self.cmb_compute.currentText()
+
+        cfg.out_w = int(self.sp_w.spin.value())
+        cfg.out_h = int(self.sp_h.spin.value())
+        cfg.fps = int(self.sp_fps.spin.value())
+        cfg.rotate90 = self.cb_rot.isChecked()
+
+        cfg.nvenc_preset = self.cmb_preset.currentText()
+        cfg.nvenc_cq = int(self.sp_cq.spin.value())
+        cfg.nvenc_bitrate = self.ed_br.text().strip()
+        cfg.nvenc_maxrate = self.ed_mr.text().strip()
+        cfg.nvenc_bufsize = self.ed_bs.text().strip()
+
+        return cfg
+
+    def apply_config(self, cfg: CutterConfig):
+        self.cfg = cfg
+        self.p_input.set_text(cfg.input_dir)
+        self.p_output.set_text(cfg.output_dir)
+        self.p_font.set_text(cfg.font_path)
+        self.p_ffmpeg.set_text(cfg.ffmpeg_path)
+        self.p_ffprobe.set_text(cfg.ffprobe_path)
+
+        self.sp_num.spin.setValue(cfg.num_shorts)
+        self.ds_total.spin.setValue(cfg.seg_total_len)
+        self.ds_pre.spin.setValue(cfg.seg_pre)
+        self.ds_post.spin.setValue(cfg.seg_post)
+        self.ds_gap.spin.setValue(cfg.min_gap_factor)
+
+        self.cb_enable_subs.setChecked(cfg.enable_subs)
+        self.cmb_lang.setCurrentText(cfg.language)
+        self.cmb_model.setCurrentText(cfg.whisper_model)
+        self.cmb_device.setCurrentText(cfg.whisper_device)
+        self.cmb_compute.setCurrentText(cfg.whisper_compute)
+
+        self.sp_w.spin.setValue(cfg.out_w)
+        self.sp_h.spin.setValue(cfg.out_h)
+        self.sp_fps.spin.setValue(cfg.fps)
+        self.cb_rot.setChecked(cfg.rotate90)
+
+        self.cmb_preset.setCurrentText(cfg.nvenc_preset)
+        self.sp_cq.spin.setValue(cfg.nvenc_cq)
+        self.ed_br.setText(cfg.nvenc_bitrate)
+        self.ed_mr.setText(cfg.nvenc_maxrate)
+        self.ed_bs.setText(cfg.nvenc_bufsize)
+
+    def save_profile(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Сохранить профиль", os.getcwd(), "JSON (*.json)")
+        if not path:
+            return
+        cfg = self.pull_config()
+        cfg.save(path)
+        self.append_log(f"Профиль сохранён: {path}")
+
+    def load_profile(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Загрузить профиль", os.getcwd(), "JSON (*.json)")
+        if not path:
+            return
+        cfg = CutterConfig.load(path)
+        self.apply_config(cfg)
+        self.append_log(f"Профиль загружен: {path}")
+
+    def set_running(self, running: bool):
+        self.btn_start.setEnabled(not running)
+        self.btn_cancel.setEnabled(running)
+        self.btn_refresh.setEnabled(not running)
+        self.btn_save_prof.setEnabled(not running)
+        self.btn_load_prof.setEnabled(not running)
+        self.p_input.setEnabled(not running)
+        self.p_output.setEnabled(not running)
+        self.p_font.setEnabled(not running)
+        self.p_ffmpeg.setEnabled(not running)
+        self.p_ffprobe.setEnabled(not running)
+
+    def start_processing(self):
+        videos = self.table_videos()
+        if not videos:
+            QtWidgets.QMessageBox.warning(self, "Нет видео", "В списке нет выбранных видео.")
+            return
+
+        cfg = self.pull_config()
+
+        # Проверка FFmpeg/FFprobe
+        ffmpeg_valid = is_valid_ffmpeg_path(cfg.ffmpeg_path)
+        ffprobe_valid = is_valid_ffmpeg_path(cfg.ffprobe_path)
+
+        if not ffmpeg_valid or not ffprobe_valid:
+            msg = "Не найдены исполняемые файлы:\n"
+            if not ffmpeg_valid:
+                msg += f"- FFmpeg: {cfg.ffmpeg_path}\n"
+            if not ffprobe_valid:
+                msg += f"- FFprobe: {cfg.ffprobe_path}\n"
+            msg += "\nУкажите правильные пути в настройках."
+            QtWidgets.QMessageBox.critical(self, "Ошибка FFmpeg", msg)
+            return
+
+        if not os.path.isdir(cfg.input_dir):
+            QtWidgets.QMessageBox.warning(self, "Путь", "Неверная входная папка.")
+            return
+        if not os.path.isdir(cfg.output_dir):
+            try:
+                ensure_dir(cfg.output_dir)
+            except Exception:
+                QtWidgets.QMessageBox.warning(self, "Путь", "Не удалось создать выходную папку.")
+                return
+        if cfg.enable_subs and (not os.path.isfile(cfg.font_path)):
+            QtWidgets.QMessageBox.warning(self, "Шрифт", "Файл шрифта не найден. Укажите корректный ttf.")
+            return
+
+        self.append_log("Старт обработки…")
+        self.pb.setValue(0)
+        self.set_running(True)
+
+        self.worker = CutterWorker(cfg, videos)
+        self.worker.status_line.connect(self.append_log)
+        self.worker.progress_changed.connect(self.pb.setValue)
+        self.worker.finished_ok.connect(self.on_finished_ok)
+        self.worker.finished_err.connect(self.on_finished_err)
+        self.worker.start()
+
+    def cancel_processing(self):
+        if self.worker:
+            self.worker.cancel()
+            self.append_log("Запрошена отмена…")
+
+    def on_finished_ok(self):
+        self.append_log("Готово!")
+        self.set_running(False)
+
+    def on_finished_err(self, err: str):
+        self.append_log(f"Ошибка: {err}")
+        self.set_running(False)
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    if HAS_QDARK:
+        qdarktheme.setup_theme("dark")
+    else:
+        app.setStyle("Fusion")
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
